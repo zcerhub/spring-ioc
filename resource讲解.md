@@ -371,13 +371,108 @@ private final ResourceLoader resourceLoader;
 }
 ```
 
-可见ComponentScanAnnotationParser类其实也只是个中间类，最终扫描交给ClassPathBeanDefinitionScanner类完成，这个就是单一职责的好处，将责任划分的单一意味着其复用的可能性大大增加，除了ClassPathBeanDefinitionScanner其余的parse只是为其传递参数。接着查看最终的扫描方法ClassPathBeanDefinitionScanner#doScan：
+可见ComponentScanAnnotationParser类其实也只是个中间类，最终扫描交给ClassPathBeanDefinitionScanner类完成，这个就是单一职责的好处，将责任划分的单一意味着其复用的可能性大大增加，除了ClassPathBeanDefinitionScanner其余的parse只是为其传递参数。最终的扫描方法ClassPathBeanDefinitionScanner的doScan方法。
+
+##### ClassPathBeanDefinitionScanner
+
+类结构图：
+
+![1637158293223](D:\code\java-interview\知识总结\spring-ioc\assets\1637158293223.png)
+
+1.对resourceLoader的处理：
+
+```
+public class ClassPathBeanDefinitionScanner extends ClassPathScanningCandidateComponentProvider {
+	
+		//通过构造方法接收外界传递的resourceLoader对象
+		public ClassPathBeanDefinitionScanner(BeanDefinitionRegistry registry, boolean useDefaultFilters,
+			Environment environment, @Nullable ResourceLoader resourceLoader) {
+		...
+		//setResourceLoader方法为父类ClassPathScanningCandidateComponentProvider中的方法
+		setResourceLoader(resourceLoader);
+	}
+
+}
+```
+
+ClassPathScanningCandidateComponentProvider#setResourceLoader：
+
+```
+public class ClassPathScanningCandidateComponentProvider implements EnvironmentCapable, ResourceLoaderAware {
+
+    private ResourcePatternResolver resourcePatternResolver;
+
+    public void setResourceLoader(@Nullable ResourceLoader resourceLoader) {
+	   //通过resourceLoader获得resourcePatternResolver对象
+       this.resourcePatternResolver = ResourcePatternUtils.getResourcePatternResolver(resourceLoader);
+      ...
+    }
+    
+}    
+```
+
+通过utils工具类根据resourceLoader创建resourcePatternResolver。进入工具类里面：
+
+```
+public static ResourcePatternResolver getResourcePatternResolver(@Nullable ResourceLoader resourceLoader) {
+   if (resourceLoader instanceof ResourcePatternResolver) {
+      return (ResourcePatternResolver) resourceLoader;
+   }
+   else if (resourceLoader != null) {
+      return new PathMatchingResourcePatternResolver(resourceLoader);
+   }
+   else {
+      return new PathMatchingResourcePatternResolver();
+   }
+}
+```
+
+如果resourceLoader已经是ResourcePatternResolver的子类了，强转换后返回。否则通过resourceLoader创建PathMatchingResourcePatternResolver对象。
+
+![1637159511901](D:\code\java-interview\知识总结\spring-ioc\assets\1637159511901.png)
+
+ResourceLoader作为ResourcePatternResolver的父类，也会有其它非ResourcePatternResolver子类的实现类，此时resourceLoader instanceof ResourcePatternResolver是可以为false的。总结起来就是，当外部传入ResourcePatternResolver时使用传入的实现类，否则创建其实现类PathMatchingResourcePatternResolver。
+
+```
+public interface ResourcePatternResolver extends ResourceLoader {
+
+   Resource[] getResources(String locationPattern) throws IOException;
+
+}
+```
+
+ResourcePatternResolver和ResourceLoader的区别：ResourcePatternResolver根据一定的规则加载资源，返回的是Resource[]，ResourceLoader是根据指定路径加载资源，返回的是单个Resource对象。不得不说spring这种设计真好。因为规则可以是不同的，会将根据不同的规则解析成单个资源的路径，这样就可以通过ResourceLoader提供的方法加载单个资源了。
+
+PathMatchingResourcePatternResolver：
+
+```
+public class PathMatchingResourcePatternResolver implements ResourcePatternResolver {
+
+	private final ResourceLoader resourceLoader;
+	
+	//无参构造中会创建DefaultResourceLoader
+    public PathMatchingResourcePatternResolver() {
+		this.resourceLoader = new DefaultResourceLoader();
+	}
+	
+	//使用传入的resourceLoader
+    public PathMatchingResourcePatternResolver(ResourceLoader resourceLoader) {	
+		this.resourceLoader = resourceLoader;
+	}
+	
+}	
+```
+
+ResourcePatternResolve是作为ResourceLoader的装饰类，在其上进行功能扩展。
+
+2.利用resourceLoader加载到BeanDefinitions：
 
 ```
 protected Set<BeanDefinitionHolder> doScan(String... basePackages) {
-   Assert.notEmpty(basePackages, "At least one base package must be specified");
+  //有意思是使用了LinkedHashSet：不仅去重而且保持了BeanDefinition的顺序
    Set<BeanDefinitionHolder> beanDefinitions = new LinkedHashSet<>();
    for (String basePackage : basePackages) {
+   	 //findCandidateComponents方法在父类中
       Set<BeanDefinition> candidates = findCandidateComponents(basePackage);
       for (BeanDefinition candidate : candidates) {
          ScopeMetadata scopeMetadata = this.scopeMetadataResolver.resolveScopeMetadata(candidate);
@@ -401,3 +496,81 @@ protected Set<BeanDefinitionHolder> doScan(String... basePackages) {
    return beanDefinitions;
 }
 ```
+
+org.springframework.context.annotation.ClassPathScanningCandidateComponentProvider#findCandidateComponents：
+
+```
+	public Set<BeanDefinition> findCandidateComponents(String basePackage) {
+		//componentsIndex是spring的优化，给BeanDefinition建立索引加快BeanDefinition的创建，可以忽略
+		if (this.componentsIndex != null && indexSupportsIncludeFilters()) {
+			return addCandidateComponentsFromIndex(this.componentsIndex, basePackage);
+		}
+		else {
+			//关键的方法：scanCandidateComponents
+			return scanCandidateComponents(basePackage);
+		}
+	}
+	
+		private Set<BeanDefinition> scanCandidateComponents(String basePackage) {
+		Set<BeanDefinition> candidates = new LinkedHashSet<>();
+		try {
+			//CLASSPATH_ALL_URL_PREFIX常量为：classpath*:，resolveBasePackage方法就是个工具方法可以忽略，resourcePattern是字符串常量："**/*.class"，用来匹配包及其子包 先的所有class文件，意味着我们可以自定义需要匹配class文件，比如：myPackage/*.class。
+			String packageSearchPath = ResourcePatternResolver.CLASSPATH_ALL_URL_PREFIX +
+					resolveBasePackage(basePackage) + '/' + this.resourcePattern;
+		    //resourcePatternResolver的getResources方法加载指定路径下的所有resource对象
+			Resource[] resources = getResourcePatternResolver().getResources(packageSearchPath);
+			for (Resource resource : resources) {
+				//只处理可读的资源，
+				if (resource.isReadable()) {
+					try {
+						MetadataReader metadataReader = getMetadataReaderFactory().getMetadataReader(resource);
+						if (isCandidateComponent(metadataReader)) {
+							ScannedGenericBeanDefinition sbd = new ScannedGenericBeanDefinition(metadataReader);
+							sbd.setResource(resource);
+							sbd.setSource(resource);
+							if (isCandidateComponent(sbd)) {
+								if (debugEnabled) {
+									logger.debug("Identified candidate component class: " + resource);
+								}
+								candidates.add(sbd);
+							}
+							else {
+								if (debugEnabled) {
+									logger.debug("Ignored because not a concrete top-level class: " + resource);
+								}
+							}
+						}
+						else {
+							if (traceEnabled) {
+								logger.trace("Ignored because not matching any filter: " + resource);
+							}
+						}
+					}
+					catch (Throwable ex) {
+						throw new BeanDefinitionStoreException(
+								"Failed to read candidate component class: " + resource, ex);
+					}
+				}
+				else {
+					if (traceEnabled) {
+						logger.trace("Ignored because not readable: " + resource);
+					}
+				}
+			}
+		}
+		catch (IOException ex) {
+			throw new BeanDefinitionStoreException("I/O failure during classpath scanning", ex);
+		}
+		return candidates;
+	}
+
+
+	//返回外部传入的resourcePatternResolver或者PathMatchingResourcePatternResolver对象
+	private ResourcePatternResolver getResourcePatternResolver() {
+		if (this.resourcePatternResolver == null) {
+			this.resourcePatternResolver = new PathMatchingResourcePatternResolver();
+		}
+		return this.resourcePatternResolver;
+	}
+```
+
