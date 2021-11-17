@@ -1,0 +1,360 @@
+
+### ConfigurationClassBeanFactoryPostProcessor实现原理
+
+```
+	protected void processConfigurationClass(ConfigurationClass configClass, Predicate<String> filter) throws IOException {
+		if (this.conditionEvaluator.shouldSkip(configClass.getMetadata(), ConfigurationPhase.PARSE_CONFIGURATION)) {
+			return;
+		}
+
+		ConfigurationClass existingClass = this.configurationClasses.get(configClass);
+		if (existingClass != null) {
+			if (configClass.isImported()) {
+				if (existingClass.isImported()) {
+					existingClass.mergeImportedBy(configClass);
+				}
+				// Otherwise ignore new imported config class; existing non-imported class overrides it.
+				return;
+			}
+			else {
+				// Explicit bean definition found, probably replacing an import.
+				// Let's remove the old one and go with the new one.
+				this.configurationClasses.remove(configClass);
+				this.knownSuperclasses.values().removeIf(configClass::equals);
+			}
+		}
+
+		// Recursively process the configuration class and its superclass hierarchy.
+		SourceClass sourceClass = asSourceClass(configClass, filter);
+		do {
+			//当configuration有父类时返回sourceClass接着解析，如：com.ctsi.ssdc.config.SecurityConfiguration、com.ctsi.ssdc.config.MethodSecurityConfiguration
+			sourceClass = doProcessConfigurationClass(configClass, sourceClass, filter);
+		}
+		while (sourceClass != null);
+
+		this.configurationClasses.put(configClass, configClass);
+	}
+	
+	
+		protected final SourceClass doProcessConfigurationClass(
+			ConfigurationClass configClass, SourceClass sourceClass, Predicate<String> filter)
+			throws IOException {
+
+		if (configClass.getMetadata().isAnnotated(Component.class.getName())) {
+			// Recursively process any member (nested) classes first
+			processMemberClasses(configClass, sourceClass, filter);
+		}
+
+		// Process any @PropertySource annotations
+		for (AnnotationAttributes propertySource : AnnotationConfigUtils.attributesForRepeatable(
+				sourceClass.getMetadata(), PropertySources.class,
+				org.springframework.context.annotation.PropertySource.class)) {
+			if (this.environment instanceof ConfigurableEnvironment) {
+				processPropertySource(propertySource);
+			}
+			else {
+				logger.info("Ignoring @PropertySource annotation on [" + sourceClass.getMetadata().getClassName() +
+						"]. Reason: Environment must implement ConfigurableEnvironment");
+			}
+		}
+
+		// Process any @ComponentScan annotations
+		Set<AnnotationAttributes> componentScans = AnnotationConfigUtils.attributesForRepeatable(
+				sourceClass.getMetadata(), ComponentScans.class, ComponentScan.class);
+		if (!componentScans.isEmpty() &&
+				!this.conditionEvaluator.shouldSkip(sourceClass.getMetadata(), ConfigurationPhase.REGISTER_BEAN)) {
+			for (AnnotationAttributes componentScan : componentScans) {
+				// The config class is annotated with @ComponentScan -> perform the scan immediately
+				Set<BeanDefinitionHolder> scannedBeanDefinitions =
+						this.componentScanParser.parse(componentScan, sourceClass.getMetadata().getClassName());
+				// Check the set of scanned definitions for any further config classes and parse recursively if needed
+				for (BeanDefinitionHolder holder : scannedBeanDefinitions) {
+					BeanDefinition bdCand = holder.getBeanDefinition().getOriginatingBeanDefinition();
+					if (bdCand == null) {
+						bdCand = holder.getBeanDefinition();
+					}
+					if (ConfigurationClassUtils.checkConfigurationClassCandidate(bdCand, this.metadataReaderFactory)) {
+						parse(bdCand.getBeanClassName(), holder.getBeanName());
+					}
+				}
+			}
+		}
+
+		// Process any @Import annotations
+		processImports(configClass, sourceClass, getImports(sourceClass), filter, true);
+
+		// Process any @ImportResource annotations
+		AnnotationAttributes importResource =
+				AnnotationConfigUtils.attributesFor(sourceClass.getMetadata(), ImportResource.class);
+		if (importResource != null) {
+			String[] resources = importResource.getStringArray("locations");
+			Class<? extends BeanDefinitionReader> readerClass = importResource.getClass("reader");
+			for (String resource : resources) {
+				String resolvedResource = this.environment.resolveRequiredPlaceholders(resource);
+				configClass.addImportedResource(resolvedResource, readerClass);
+			}
+		}
+		
+		//顺便解析出@Bean修饰的方法
+		// Process individual @Bean methods
+		Set<MethodMetadata> beanMethods = retrieveBeanMethodMetadata(sourceClass);
+		for (MethodMetadata methodMetadata : beanMethods) {
+			configClass.addBeanMethod(new BeanMethod(methodMetadata, configClass));
+		}
+
+		// Process default methods on interfaces
+		processInterfaces(configClass, sourceClass);
+
+		// Process superclass, if any
+		if (sourceClass.getMetadata().hasSuperClass()) {
+			String superclass = sourceClass.getMetadata().getSuperClassName();
+			if (superclass != null && !superclass.startsWith("java") &&
+					!this.knownSuperclasses.containsKey(superclass)) {
+				this.knownSuperclasses.put(superclass, configClass);
+				// Superclass found, return its annotation metadata and recurse
+				return sourceClass.getSuperClass();
+			}
+		}
+
+		// No superclass -> processing is complete
+		return null;
+	}
+
+	
+	
+	private void processImports(ConfigurationClass configClass, SourceClass currentSourceClass,
+			Collection<SourceClass> importCandidates, Predicate<String> exclusionFilter,
+			boolean checkForCircularImports) {
+
+		if (importCandidates.isEmpty()) {
+			return;
+		}
+
+		if (checkForCircularImports && isChainedImportOnStack(configClass)) {
+			this.problemReporter.error(new CircularImportProblem(configClass, this.importStack));
+		}
+		else {
+			this.importStack.push(configClass);
+			try {
+				for (SourceClass candidate : importCandidates) {
+					if (candidate.isAssignable(ImportSelector.class)) {
+						// Candidate class is an ImportSelector -> delegate to it to determine imports
+						Class<?> candidateClass = candidate.loadClass();
+						ImportSelector selector = ParserStrategyUtils.instantiateClass(candidateClass, ImportSelector.class,
+								this.environment, this.resourceLoader, this.registry);
+						Predicate<String> selectorFilter = selector.getExclusionFilter();
+						if (selectorFilter != null) {
+							exclusionFilter = exclusionFilter.or(selectorFilter);
+						}
+						//如果selector需要延迟处理则加入到deferredImportSelectorHandler
+						if (selector instanceof DeferredImportSelector) {
+							this.deferredImportSelectorHandler.handle(configClass, (DeferredImportSelector) selector);
+						}
+						//否则，调用selector的selectImports方法
+						else {
+							String[] importClassNames = selector.selectImports(currentSourceClass.getMetadata());
+							Collection<SourceClass> importSourceClasses = asSourceClasses(importClassNames, exclusionFilter);
+							processImports(configClass, currentSourceClass, importSourceClasses, exclusionFilter, false);
+						}
+					}
+					else if (candidate.isAssignable(ImportBeanDefinitionRegistrar.class)) {
+						// Candidate class is an ImportBeanDefinitionRegistrar ->
+						// delegate to it to register additional bean definitions
+						Class<?> candidateClass = candidate.loadClass();
+						ImportBeanDefinitionRegistrar registrar =
+								ParserStrategyUtils.instantiateClass(candidateClass, ImportBeanDefinitionRegistrar.class,
+										this.environment, this.resourceLoader, this.registry);
+						configClass.addImportBeanDefinitionRegistrar(registrar, currentSourceClass.getMetadata());
+					}
+					else {
+						// Candidate class not an ImportSelector or ImportBeanDefinitionRegistrar ->
+						// process it as an @Configuration class
+						this.importStack.registerImport(
+								currentSourceClass.getMetadata(), candidate.getMetadata().getClassName());
+						processConfigurationClass(candidate.asConfigClass(configClass), exclusionFilter);
+					}
+				}
+			}
+			catch (BeanDefinitionStoreException ex) {
+				throw ex;
+			}
+			catch (Throwable ex) {
+				throw new BeanDefinitionStoreException(
+						"Failed to process import candidates for configuration class [" +
+						configClass.getMetadata().getClassName() + "]", ex);
+			}
+			finally {
+				this.importStack.pop();
+			}
+		}
+	}	
+	
+```
+
+org.springframework.context.annotation.DeferredImportSelector：加载顺序在所有的@Configuration类的加载后，因为此时意味着基本上所有的bean都已经加载完毕，这是因为DeferredImportSelector中的类可能会被@Condition注解修饰，得要根据不同的情况看判断进行是否加载。
+
+```
+	public void processConfigBeanDefinitions(BeanDefinitionRegistry registry) {
+			...
+		do {
+			parser.parse(candidates);
+			parser.validate();
+			...
+			//先对configuration类进行解析，然后从解析到的configuration类中注册bean，如：@Bean修饰的方法、@import机制导入的bean
+			this.reader.loadBeanDefinitions(configClasses);
+			...
+
+	}
+
+```
+
+处理configuration类的主要逻辑是先解析，将解析结果封装到org.springframework.context.annotation.ConfigurationClass中，该类中保存有被@Bean修饰的方法，通过ImportBeanDefinitionRegistrar修饰的类。然后才将beandefinition注册到IOC中。解析的特点是先将所有的configuration类解析完毕然后DeferredImportSelector才开始处理。
+
+```
+	public void parse(Set<BeanDefinitionHolder> configCandidates) {
+		for (BeanDefinitionHolder holder : configCandidates) {
+			BeanDefinition bd = holder.getBeanDefinition();
+				...
+				parse(((AnnotatedBeanDefinition) bd).getMetadata(), holder.getBeanName());
+				...
+		}
+
+		this.deferredImportSelectorHandler.process();
+	}
+```
+
+解析configuration的特点是通过while的方式进行处理，主要是configuration类存在继承关系，解析完子类后需要解析父类，通过doProcessConfigurationClass返回其父类后就可以接着解析父类了
+
+```
+	protected void processConfigurationClass(ConfigurationClass configClass, Predicate<String> filter) throws IOException {
+		...
+		do {
+			sourceClass = doProcessConfigurationClass(configClass, sourceClass, filter);
+		}
+		while (sourceClass != null);
+		...		
+	}
+```
+
+进入解析configuration类的最主要的逻辑是依次处理Component、ComponentScan、Import、Bean注解的信息。在处理ComponentScan需要递归处理扫描到的类。
+
+```
+	protected final SourceClass doProcessConfigurationClass(
+			ConfigurationClass configClass, SourceClass sourceClass, Predicate<String> filter)
+			throws IOException {
+
+		if (configClass.getMetadata().isAnnotated(Component.class.getName())) {
+			processMemberClasses(configClass, sourceClass, filter);
+		}
+		...
+		Set<AnnotationAttributes> componentScans = AnnotationConfigUtils.attributesForRepeatable(
+				sourceClass.getMetadata(), ComponentScans.class, ComponentScan.class);
+		...
+		processImports(configClass, sourceClass, getImports(sourceClass), filter, true);
+		...
+		Set<MethodMetadata> beanMethods = retrieveBeanMethodMetadata(sourceClass);
+		for (MethodMetadata methodMetadata : beanMethods) {
+			configClass.addBeanMethod(new BeanMethod(methodMetadata, configClass));
+		}
+		...
+		return null;
+	}
+```
+
+org.springframework.context.annotation.ConfigurationClassPostProcessor：
+
+```
+	//postProcessBeanDefinitionRegistry：在该方法中解析configuration类的注解，以及beandefinition的注册
+	public void postProcessBeanDefinitionRegistry(BeanDefinitionRegistry registry) {
+		int registryId = System.identityHashCode(registry);
+		if (this.registriesPostProcessed.contains(registryId)) {
+			throw new IllegalStateException(
+					"postProcessBeanDefinitionRegistry already called on this post-processor against " + registry);
+		}
+		if (this.factoriesPostProcessed.contains(registryId)) {
+			throw new IllegalStateException(
+					"postProcessBeanFactory already called on this post-processor against " + registry);
+		}
+		this.registriesPostProcessed.add(registryId);
+
+		processConfigBeanDefinitions(registry);
+	}
+	
+	
+	//1.用于给configuration类生成代理类；2.添加ImportAwareBeanPostProcessor到ioc容器
+	public void postProcessBeanFactory(ConfigurableListableBeanFactory beanFactory) {
+		int factoryId = System.identityHashCode(beanFactory);
+		if (this.factoriesPostProcessed.contains(factoryId)) {
+			throw new IllegalStateException(
+					"postProcessBeanFactory already called on this post-processor against " + beanFactory);
+		}
+		this.factoriesPostProcessed.add(factoryId);
+		if (!this.registriesPostProcessed.contains(factoryId)) {
+			// BeanDefinitionRegistryPostProcessor hook apparently not supported...
+			// Simply call processConfigurationClasses lazily at this point then.
+			processConfigBeanDefinitions((BeanDefinitionRegistry) beanFactory);
+		}
+
+		enhanceConfigurationClasses(beanFactory);
+		beanFactory.addBeanPostProcessor(new ImportAwareBeanPostProcessor(beanFactory));
+	}
+```
+
+# 对@Configuration类生成代理的原因探究
+
+```
+@Configuration
+public class AppConfig {
+
+    @Bean
+    public UserDao userDao(){
+        // 会被打印几次 ？？
+        System.out.println("注入UserDao");
+        return new UserDao();
+    }
+
+    @Bean
+    public OrderDao orderDao(){
+        // 在这里调用userDao()方法
+        userDao();
+        return new OrderDao();
+    }
+
+}
+```
+
+将@Bean修饰的方法实际上是通过工厂方法生成需要的bean，方法的返回值就是要放入容器中的对象。
+
+![image-20210806204959650](../springboot/sprinboot原理.assets/image-20210806204959650.png)
+
+## 同样是动态代理，为啥在spring aop中代理类中引用就会失效，而在configuration类中就可以生效
+
+根据debug可以看到当调用orderDao方法时，此时的this为代理类，在代理类中调用userDao方法当然会进入intercept方法执行代理逻辑。
+
+![image-20210807101526985](../springboot/sprinboot原理.assets/image-20210807101526985.png)
+
+用伪代码的方式表示如下：
+
+```
+class  AppConfig$$ProxyClass extend AppConfig{
+
+	public OrderDao orderDao(){
+		
+		拦截逻辑，即intercept方法中的内容
+		被代理类的逻辑
+	
+	}
+
+}
+```
+
+最终的结果是起到的作用和静态植入的逻辑类似，所以可以执行代理类的逻辑，而代理类中查看该方法是否已经生成了bean对象，则从ioc容器中获取对应的bean，否则执行代理类的方法创建bean对象放入到ioc容器中。
+
+通过this获取到所有的方法，从方法名称可以看到确实是代理类对象。
+
+
+[spring aop失效及其解决方法](https://blog.csdn.net/blueheart20/article/details/97258549)
+
+[configuration注解的原理](https://bbs.huaweicloud.com/blogs/detail/165924)
+
+[import的三种使用方式](https://www.codeleading.com/article/2914861719/)
