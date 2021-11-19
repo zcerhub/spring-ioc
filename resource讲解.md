@@ -513,7 +513,6 @@ org.springframework.context.annotation.ClassPathScanningCandidateComponentProvid
 	
 		private Set<BeanDefinition> scanCandidateComponents(String basePackage) {
 		Set<BeanDefinition> candidates = new LinkedHashSet<>();
-		try {
 			//CLASSPATH_ALL_URL_PREFIX常量为：classpath*:，resolveBasePackage方法就是个工具方法可以忽略，resourcePattern是字符串常量："**/*.class"，用来匹配包及其子包 先的所有class文件，意味着我们可以自定义需要匹配class文件，比如：myPackage/*.class。
 			String packageSearchPath = ResourcePatternResolver.CLASSPATH_ALL_URL_PREFIX +
 					resolveBasePackage(basePackage) + '/' + this.resourcePattern;
@@ -522,44 +521,21 @@ org.springframework.context.annotation.ClassPathScanningCandidateComponentProvid
 			for (Resource resource : resources) {
 				//只处理可读的资源，
 				if (resource.isReadable()) {
-					try {
+						//有意识的是使用MetadataReader读取class文件的属性，而MetadataReader是基于ASM的ClassReader,该类直接读取class文件类的元数据信息。避免使用反射获取类的属性，因为反射需要加载类到内存中，而有些类文件是不需要加载的，否则只能白白浪费内存
 						MetadataReader metadataReader = getMetadataReaderFactory().getMetadataReader(resource);
+						//如果metadataReader满足用户在@ComponentScan中的配置，为该类对象创建sbd
 						if (isCandidateComponent(metadataReader)) {
 							ScannedGenericBeanDefinition sbd = new ScannedGenericBeanDefinition(metadataReader);
 							sbd.setResource(resource);
 							sbd.setSource(resource);
+							//根据sbd判断是否满足Component对象的条件，满足将其加入到candidates中。 只要类不是内部类，并且类不是抽象类或接口，或者是抽象类中的方法被@Lookup修饰就满足该条件。
 							if (isCandidateComponent(sbd)) {
-								if (debugEnabled) {
-									logger.debug("Identified candidate component class: " + resource);
-								}
 								candidates.add(sbd);
 							}
-							else {
-								if (debugEnabled) {
-									logger.debug("Ignored because not a concrete top-level class: " + resource);
-								}
-							}
 						}
-						else {
-							if (traceEnabled) {
-								logger.trace("Ignored because not matching any filter: " + resource);
-							}
-						}
-					}
-					catch (Throwable ex) {
-						throw new BeanDefinitionStoreException(
-								"Failed to read candidate component class: " + resource, ex);
-					}
-				}
-				else {
-					if (traceEnabled) {
-						logger.trace("Ignored because not readable: " + resource);
 					}
 				}
 			}
-		}
-		catch (IOException ex) {
-			throw new BeanDefinitionStoreException("I/O failure during classpath scanning", ex);
 		}
 		return candidates;
 	}
@@ -573,4 +549,65 @@ org.springframework.context.annotation.ClassPathScanningCandidateComponentProvid
 		return this.resourcePatternResolver;
 	}
 ```
+
+ClassPathScanningCandidateComponentProvider#isCandidateComponent：
+
+```
+protected boolean isCandidateComponent(MetadataReader metadataReader) throws IOException {
+    Iterator var2 = this.excludeFilters.iterator();
+
+    TypeFilter tf;
+    do {
+        if (!var2.hasNext()) {
+            var2 = this.includeFilters.iterator();
+
+            do {
+                if (!var2.hasNext()) {
+                    return false;
+                }
+
+                tf = (TypeFilter)var2.next();
+            } while(!tf.match(metadataReader, this.getMetadataReaderFactory()));
+
+            return this.isConditionMatch(metadataReader);
+        }
+
+        tf = (TypeFilter)var2.next();
+    } while(!tf.match(metadataReader, this.getMetadataReaderFactory()));
+
+    return false;
+}
+```
+
+该方法判断该类是否满足用户配置的excludeFilters和includeFilters条件。
+
+ClassPathScanningCandidateComponentProvider#isCandidateComponent：
+
+```
+protected boolean isCandidateComponent(AnnotatedBeanDefinition beanDefinition) {
+    AnnotationMetadata metadata = beanDefinition.getMetadata();
+    //isIndependent判断该类是否是内部类，isConcrete判断该类是否是接口或者抽象类，isAbstract判断该类是否是抽象的
+    return metadata.isIndependent() && (metadata.isConcrete() || metadata.isAbstract() && metadata.hasAnnotatedMethods(Lookup.class.getName()));
+}
+```
+
+##### ScannedGenericBeanDefinition
+
+![1637333397105](D:\code\java-interview\知识总结\spring-ioc\assets\1637333397105.png)
+
+该BeanDefinition中使用metadata保存类及方法上的注解的信息。
+
+##### TypeFilter
+
+默认的Springboot应用会注册下面的TypeFilter
+
+![1637333857841](D:\code\java-interview\知识总结\spring-ioc\assets\1637333857841.png)
+
+分别研究这四类TypeFilter注册是实际以及功能
+
+###### AnnotationTypeFilter
+
+类结构如下：
+
+![1637333980050](D:\code\java-interview\知识总结\spring-ioc\assets\1637333980050.png)
 
